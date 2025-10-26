@@ -1,12 +1,11 @@
-
 # app_stream_online.py
 """
-Streamlit app: GripAndReview Bot (basic online version)
-Features:
-- Scrape a URL (simple HTML text extraction)
-- Summarize using Groq (preferred) or Ollama (fallback if configured)
-- Combine / Render a short article
-- Save result to Google Sheets (via gspread + service account JSON passed in Streamlit secrets)
+Streamlit app: GripAndReview Bot (Online Version)
+------------------------------------------------
+Fungsi utama:
+- Scrape URL atau teks manual
+- Ringkas dan ubah menjadi artikel review (Groq / Ollama / fallback)
+- Simpan hasil otomatis ke Google Sheets
 """
 
 import os
@@ -18,210 +17,149 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 
-# AI provider: groq library if available
-try:
-    import groq
-    HAS_GROQ = True
-except Exception:
-    HAS_GROQ = False
-
 # Google Sheets
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-    HAS_GSPREAD = True
-except Exception:
-    HAS_GSPREAD = False
+import gspread
+from google.oauth2.service_account import Credentials
 
-# local config
+# Local config
 from config import (
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    GCP_SERVICE_ACCOUNT_JSON,
     DEFAULT_GROQ_MODEL,
     DEFAULT_SUMMARY_TOKENS,
     DEFAULT_SHEET_NAME,
+    OLLAMA_URL,
 )
 
+# -------------------- SETUP --------------------
 st.set_page_config(page_title="GripAndReview Bot (Online)", layout="centered")
+st.title("🧠 GripAndReview — Bot Artikel Online")
 
-st.title("GripAndReview — Bot Artikel (Online)")
+# Sidebar status
+st.sidebar.header("Integrasi & Status")
 
-# --- Sidebar: settings & secrets checks ---
-st.sidebar.header("Settings & Integrations")
+st.sidebar.markdown(f"**Groq API Key:** {'✅ OK' if GROQ_API_KEY else '❌ Missing'}")
+st.sidebar.markdown(f"**Google Sheets:** {'✅ OK' if GCP_SERVICE_ACCOUNT_JSON else '❌ Missing'}")
+st.sidebar.markdown(f"**Ollama URL:** {OLLAMA_URL or '-'}")
+sheet_name = st.sidebar.text_input("Google Sheet Name", value=DEFAULT_SHEET_NAME)
+st.sidebar.divider()
 
-use_groq = st.sidebar.checkbox("Use Groq (if API key configured)", value=True)
-use_ollama = st.sidebar.checkbox("Use Ollama (fallback)", value=False)
-
-st.sidebar.markdown("**Output storage**")
-sheet_name = st.sidebar.text_input("Google Sheet name", value=DEFAULT_SHEET_NAME)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Integration status**")
-st.sidebar.write(f"groq client installed: {HAS_GROQ}")
-st.sidebar.write(f"gspread available: {HAS_GSPREAD}")
-
-# --- Input: URL or plain text ---
-st.subheader("Input")
-input_type = st.radio("Scrape from:", ("URL (page)", "Paste text"))
-
+# -------------------- INPUT --------------------
+st.subheader("Input Artikel")
+input_type = st.radio("Sumber teks:", ("URL (halaman web)", "Teks manual"))
 source_text = ""
-if input_type == "URL (page)":
-    url = st.text_input("Target URL (http/https)", "")
-    if st.button("Scrape & Summarize"):
+
+if input_type == "URL (halaman web)":
+    url = st.text_input("Masukkan URL target:")
+    if st.button("🕸️ Scrape halaman"):
         if not url.strip():
-            st.error("Masukkan URL terlebih dahulu.")
+            st.warning("Masukkan URL terlebih dahulu.")
         else:
-            with st.spinner("Scraping..."):
+            with st.spinner("Sedang men-scrape halaman..."):
                 try:
                     resp = requests.get(url, timeout=15, headers={
-                        "User-Agent": "gripandreview-bot/1.0 (+https://gripandreview.com)"
+                        "User-Agent": "GripAndReviewBot/1.0 (+https://gripandreview.com)"
                     })
                     resp.raise_for_status()
                     soup = BeautifulSoup(resp.text, "html.parser")
-                    # Basic article extraction heuristics
+                    # Ambil teks artikel
                     article_tags = soup.find_all(["article"])
                     if article_tags:
-                        source_text = "\n\n".join([t.get_text(separator=" ", strip=True) for t in article_tags])
+                        source_text = "\n\n".join([a.get_text(" ", strip=True) for a in article_tags])
                     else:
-                        # fallback: join all <p>
                         ps = soup.find_all("p")
-                        source_text = "\n\n".join([p.get_text(separator=" ", strip=True) for p in ps])
-                    if not source_text.strip():
-                        st.warning("Tidak menemukan teks artikel yang signifikan. Coba URL lain atau gunakan paste text.")
+                        source_text = "\n\n".join([p.get_text(" ", strip=True) for p in ps])
+                    st.text_area("Hasil scrape:", source_text[:5000], height=200)
                 except Exception as e:
-                    st.error(f"Error scraping URL: {e}")
+                    st.error(f"Gagal scrape URL: {e}")
 else:
-    source_text = st.text_area("Paste article text here", height=250)
+    source_text = st.text_area("Tempel teks artikel di sini:", height=250)
 
-# --- Summarization / generation helpers ---
-def generate_with_groq(prompt: str, model: str = DEFAULT_GROQ_MODEL, max_tokens: int = DEFAULT_SUMMARY_TOKENS) -> str:
-    """
-    Use Groq Python SDK (if installed) to create a completion/chat. 
-    Requires env var: GROQ_API_KEY (or set up according to Groq docs).
-    """
-    if not HAS_GROQ:
-        raise RuntimeError("Groq library not installed in environment.")
-    # Example using groq Python package (API may vary across versions).
-    # This minimal wrapper uses ChatCompletion-like interface used in examples.
-    from groq.cloud.core import ChatCompletion
-    with ChatCompletion(model) as chat:
-        response, *_ = chat.send_chat(prompt)
-        return response
+# -------------------- AI SUMMARIZER --------------------
+def summarize_with_groq(prompt: str) -> str:
+    """Gunakan Groq API (resmi)"""
+    from groq import Groq
+    client = Groq(api_key=GROQ_API_KEY)
+    completion = client.chat.completions.create(
+        model=GROQ_MODEL or DEFAULT_GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=DEFAULT_SUMMARY_TOKENS,
+    )
+    return completion.choices[0].message.content.strip()
 
-def generate_with_ollama(prompt: str, model: str = "llama2", max_tokens: int = 512, ollama_url: Optional[str] = None) -> str:
-    """
-    Call Ollama HTTP API. Expects OLLAMA_URL like 'http://HOST:11434' or use 'http://localhost:11434'.
-    Endpoint used: /api/generate
-    """
-    if not ollama_url:
-        raise RuntimeError("OLLAMA_URL not configured.")
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "stream": False
-    }
-    r = requests.post(f"{ollama_url.rstrip('/')}/api/generate", json=payload, timeout=60)
+def summarize_with_ollama(prompt: str) -> str:
+    """Fallback jika Ollama diaktifkan"""
+    if not OLLAMA_URL:
+        raise RuntimeError("OLLAMA_URL belum diset di secrets.")
+    payload = {"model": "llama3", "prompt": prompt, "stream": False}
+    r = requests.post(f"{OLLAMA_URL.rstrip('/')}/api/generate", json=payload, timeout=120)
     r.raise_for_status()
     data = r.json()
-    # Ollama returns structure with 'result' or 'choices' depending on version — we try a couple patterns
-    if isinstance(data, dict):
-        if "result" in data and isinstance(data["result"], str):
-            return data["result"]
-        if "choices" in data and data["choices"]:
-            return data["choices"][0].get("content", "") or data["choices"][0].get("message", {}).get("content", "")
-    return json.dumps(data)  # fallback
+    return data.get("response") or data.get("output", "")
 
-def compose_article(title: str, summary: str, source_url: Optional[str]) -> str:
-    header = f"# {title}\n\n"
-    meta = f"_Sumber: {source_url}_\n\n" if source_url else ""
-    return header + meta + summary
+def simple_fallback_summary(text: str) -> str:
+    """Ringkasan manual jika tanpa AI"""
+    words = text.split()
+    return "(Fallback) " + " ".join(words[:300]) + " ..."
 
-# --- Google Sheets helpers ---
-def gsheets_client_from_streamlit_secrets() -> gspread.Client:
-    """
-    Create a gspread client using service_account info provided via Streamlit secrets.
-    In Streamlit Community Cloud -> Secrets, store a key: "gcp_service_account" with JSON text value.
-    Example secrets.toml:
-    gcp_service_account = '''{"type": "...", "project_id": "...", ...}'''
-    """
-    if not HAS_GSPREAD:
-        raise RuntimeError("gspread/google-auth not installed.")
-    raw = st.secrets.get("gcp_service_account", None)
-    if not raw:
-        raise RuntimeError("Google service account credentials not found in Streamlit secrets (gcp_service_account).")
-    # allow both dict or JSON string
-    if isinstance(raw, dict):
-        info = raw
-    else:
-        info = json.loads(raw)
-    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    client = gspread.authorize(creds)
-    return client
+# -------------------- GOOGLE SHEETS --------------------
+def get_gsheets_client() -> gspread.Client:
+    creds = Credentials.from_service_account_info(
+        GCP_SERVICE_ACCOUNT_JSON,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return gspread.authorize(creds)
 
-def append_to_sheet(sheet_name: str, data_row: list):
-    client = gsheets_client_from_streamlit_secrets()
-    sheet = None
+def save_to_sheets(sheet_name: str, title: str, url: str, content: str):
+    client = get_gsheets_client()
     try:
-        spreadsheet = client.open(sheet_name)
+        sheet = client.open(sheet_name).sheet1
     except Exception:
-        # create new sheet (requires Drive API permission; if not allowed, user must pre-create)
-        spreadsheet = client.create(sheet_name)
-    # open first worksheet
-    worksheet = spreadsheet.sheet1
-    worksheet.append_row(data_row)
+        sheet = client.create(sheet_name).sheet1
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    sheet.append_row([timestamp, title, url, content[:10000]])
 
-# --- Main action: summarize + save ---
-st.subheader("Generate article")
+# -------------------- GENERATE ARTICLE --------------------
+st.subheader("🔧 Generate Artikel")
 
-title = st.text_input("Judul artikel (singkat)", value="(otomatis jika kosong)")
-
-if st.button("Generate Article") or (input_type == "URL (page)" and source_text and st.session_state.get("auto_generate", False)):
+title = st.text_input("Judul Artikel", "(otomatis jika kosong)")
+if st.button("🚀 Buat Artikel"):
     if not source_text.strip():
-        st.error("Tidak ada teks yang bisa diproses.")
+        st.error("Tidak ada teks untuk diproses.")
     else:
-        with st.spinner("Menyusun prompt & memanggil model..."):
-            # build prompt
+        with st.spinner("Sedang membuat ringkasan artikel..."):
             prompt = (
-                "Ringkas konten berikut menjadi artikel review singkat 6-10 paragraf. "
-                "Buat bahasa Indonesia yang enak dibaca, poin penting, dan kesimpulan akhir. "
-                "Jangan sertakan terlalu banyak kutipan; gunakan gaya friendly teknikal.\n\n"
+                "Ringkas konten berikut menjadi artikel review yang padat, natural, "
+                "dan berbahasa Indonesia. Gunakan gaya penjelasan teknikal yang ringan, "
+                "dengan struktur pembuka, isi, dan kesimpulan.\n\n"
                 f"INPUT:\n{source_text}\n\nOUTPUT:\n"
             )
-            ai_output = ""
-            # Try Groq first if enabled
             try:
-                if use_groq and HAS_GROQ and os.getenv("GROQ_API_KEY"):
-                    ai_output = generate_with_groq(prompt, model=os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL))
-                elif use_ollama and os.getenv("OLLAMA_URL"):
-                    ai_output = generate_with_ollama(prompt, model=os.getenv("OLLAMA_MODEL", "llama3"), ollama_url=os.getenv("OLLAMA_URL"))
+                if GROQ_API_KEY:
+                    summary = summarize_with_groq(prompt)
+                elif OLLAMA_URL:
+                    summary = summarize_with_ollama(prompt)
                 else:
-                    # fallback: naive simple summarizer (if no model configured)
-                    ai_output = ("(Fallback) Ringkasan otomatis: " + " ".join(source_text.split()[:250]) + " ...")
+                    summary = simple_fallback_summary(source_text)
             except Exception as e:
-                st.error(f"Gagal memanggil model: {e}")
-                ai_output = ("(Error) Tidak dapat menghasilkan ringkasan karena masalah integrasi model.")
-            # title default
+                st.error(f"Gagal menjalankan model: {e}")
+                summary = simple_fallback_summary(source_text)
+
+            # Tentukan judul otomatis
             if not title.strip():
-                # pick first sentence as title heuristic
-                title = ai_output.split("\n")[0][:80] if ai_output else "Artikel GripAndReview"
-            article = compose_article(title, ai_output, url if input_type.startswith("URL") else None)
+                title = summary.split("\n")[0][:80]
 
-            st.markdown("### Hasil Artikel (preview)")
-            st.code(article, language="markdown")
-            st.success("Selesai membuat artikel.")
+            article_md = f"# {title}\n\n{summary}"
+            st.markdown("### 📝 Hasil Artikel")
+            st.markdown(article_md)
 
-            # Save to Google Sheets
-            st.info("Menyimpan ke Google Sheets...")
+            # Simpan ke Google Sheets
             try:
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                row = [timestamp, title, url if input_type.startswith("URL") else "", ai_output[:10000]]
-                append_to_sheet(sheet_name, row)
-                st.success(f"Disimpan ke Google Sheet: {sheet_name}")
+                save_to_sheets(sheet_name, title, url if input_type.startswith("URL") else "", summary)
+                st.success(f"✅ Artikel disimpan ke Google Sheets: `{sheet_name}`")
             except Exception as e:
-                st.error(f"Gagal menyimpan ke Google Sheets: {e}\nPastikan service account punya akses edit ke sheet tersebut.")
+                st.error(f"Gagal menyimpan ke Sheets: {e}")
 
-st.markdown("---")
-st.markdown("**Catatan integrasi:**")
-st.markdown("- Untuk Groq: atur `GROQ_API_KEY` di Streamlit secrets; contoh variable `GROQ_API_KEY` dan optional `GROQ_MODEL` (mis. `llama-3b`/`llama-3-8k`).").markdown("")
-st.markdown("- Untuk Ollama (fallback): atur `OLLAMA_URL` (contoh: `http://<host>:11434`) dan `OLLAMA_MODEL`.")
-st.markdown("- Untuk Google Sheets: simpan JSON credentials service account di `gcp_service_account` di Streamlit secrets (isi JSON sebagai string).")
-
+st.divider()
+st.caption("GripAndReview Bot • Powered by Streamlit + Groq + Google Sheets")
